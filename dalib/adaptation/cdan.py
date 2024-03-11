@@ -195,11 +195,12 @@ class ConditionalDomainAdversarialLoss(nn.Module):
 
     def forward(self, g_s: torch.Tensor, f_s: torch.Tensor, g_t: torch.Tensor, f_t: torch.Tensor) -> torch.Tensor:
         f_s_origin=f_s
-        f_s =FDA_source_to_target_np(f_s.detach().cpu().numpy(),f_t.detach().cpu().numpy(), L=0.25)  #fft变换后的feature
+        f_s =FDA_source_to_target_np(f_s.detach().cpu().numpy(),f_t.detach().cpu().numpy(), L=0.5)
         f_s = torch.tensor(f_s, dtype=torch.float32, requires_grad=True)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         f_s=f_s.to(device)
-        f = torch.cat((f_s_origin,f_s,f_t), dim=0)     #和原来的一起输入
+        f = torch.cat((f_s_origin,f_s,f_t), dim=0)
+        #f = torch.cat((f_s_origin,f_t), dim=0)
         g = torch.cat((g_s,g_s,g_t), dim=0)
         g = F.softmax(g, dim=1).detach()
         h = self.grl(self.map(f, g))

@@ -8,7 +8,7 @@ import numpy
 import os.path as osp
 import os
 import wandb
-import ot
+# import ot
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
@@ -31,27 +31,53 @@ from common.utils.metric import accuracy
 from common.utils.meter import AverageMeter, ProgressMeter
 from common.utils.logger import CompleteLogger
 from common.utils.analysis import collect_feature, tsne, a_distance
+from common.utils.sam import SAM
 
 sys.path.append('.')
 import utils
 
 FN = torch.from_numpy
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+
+def find_max_indices(tensor):
+    vector = []
+    for row in tensor:
+        max_value = torch.max(row).item()
+        max_index = torch.argmax(row).item()
+        vector.append(max_index)
+    return vector
+
+
+#################################
+
+def calculate_accuracy(tensor1, tensor2):
+    tensor1 = torch.tensor(tensor1).to(device)
+    tensor2 = tensor2.to(device)
+    if tensor1.shape != tensor2.shape:
+        raise ValueError("The shapes of the input tensors must be the same.")
+
+    num_correct = torch.sum(tensor1 == tensor2).item()
+    accuracy = num_correct / tensor1.numel()
+    return accuracy
+
+
 def compute_lmmd(source_features, target_features):
     # 计算源域和目标域的局部最大均值差异（LMMD）
-    
+
     # 计算源域和目标域的均值
     source_mean = torch.mean(source_features, dim=0)
     target_mean = torch.mean(target_features, dim=0)
-    
+
     # 计算源域和目标域的中心化特征
     source_centered = source_features - source_mean
     target_centered = target_features - target_mean
-    
+
     # 计算源域和目标域的局部最大均值差异（LMMD）
     lmmd = torch.mean(torch.norm(F.normalize(source_centered, dim=1) - F.normalize(target_centered, dim=1), dim=1))
-    
+
     return lmmd
+
 
 def entropy(t1, t2):
     # 计算每个张量的概率分布
@@ -68,6 +94,7 @@ def entropy(t1, t2):
     # entropy_mean = torch.mean(entropy1 + entropy2)
 
     return entropy_sum
+
 
 def compute_kl_divergence(source_tensor, target_tensor):
     # 计算源域和目标域特征的均值和协方差矩阵
@@ -92,8 +119,8 @@ def CORAL(source, target, **kwargs):
     d = source.data.shape[1]
     # 获取源域和目标域的样本数量
     ns, nt = source.data.shape[0], target.data.shape[0]
-    #source=torch.log(source)
-    #target=torch.log(target)
+    # source=torch.log(source)
+    # target=torch.log(target)
     # 计算源域的协方差矩阵
     xm = torch.mean(source, 0, keepdim=True) - source
     xc = xm.t() @ xm / (ns - 1)
@@ -179,7 +206,7 @@ def main(args: argparse.Namespace):
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
     classifier_feature_dim = classifier.features_dim
-    
+
     if args.randomized:
         domain_discri = DomainDiscriminator(
             args.randomized_dim, hidden_size=1024).to(device)
@@ -188,10 +215,11 @@ def main(args: argparse.Namespace):
             classifier_feature_dim * num_classes, hidden_size=1024).to(device)
 
     all_parameters = classifier.get_parameters() + domain_discri.get_parameters()
-
+    # define optimizer and lr scheduler
     optimizer = SGD(all_parameters, args.lr, momentum=args.momentum,
                     weight_decay=args.weight_decay, nesterov=True)
     t_total = args.iters_per_epoch * args.epochs
+    print("{INFORMATION} The total number of steps is ", t_total)
 
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr *
                                                  (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
@@ -204,8 +232,8 @@ def main(args: argparse.Namespace):
     ).to(device)
 
     # start training
-    temp1=[2.7]
-    temp2=[7]
+    temp1 = [2.7]  # 2.7
+    temp2 = [8.05556]  # 7
     for a in temp1:
         for b in temp2:
             best_acc1 = 0.
@@ -213,13 +241,34 @@ def main(args: argparse.Namespace):
                 # train for one epoch
                 print('epoch', epoch)
                 train(source_iter, target_iter, classifier, domain_adv, optimizer,
-                      lr_scheduler, epoch, args,a,b)
+                      lr_scheduler, epoch, args, a, b)
 
                 # evaluate on validation set
                 acc1 = utils.validate(target_loader, classifier, args, device)
                 best_acc1 = max(acc1, best_acc1)
+                if acc1 == best_acc1:
+                    model = classifier
+
+            model.train()
+            f_s = torch.tensor([]).to(device).detach().cpu()
+            f_t = torch.tensor([]).to(device).detach().cpu()
+            for i, (images, source) in enumerate(source_loader):
+                images = images.to(device)
+                source = source.to(device)
+                # compute output
+                y, f1 = model(images)
+                f_s = torch.cat((f_s, f1.detach().cpu()), dim=0)
+            for i, (images, target) in enumerate(target_loader):
+                images = images.to(device)
+                target = target.to(device)
+                # compute output
+                y, f2 = model(images)
+                f_t = torch.cat((f_t, f2.detach().cpu()), dim=0)
+            tsne.visualize(f_s.detach().cpu(), f_t.detach().cpu(), 'a2w.png')
+            a_distance.calculate(f_s.detach().cpu(), f_t.detach().cpu(), device)
+
             with open("accx.txt", "a+") as file:
-                file.write(str(a)+"   ,"+str(b)+"   ,"+str(best_acc1)+"  time3\n")  # 将 best_acc 转换为字符串并写入文件
+                file.write(str(a) + "   ," + str(b) + "   ," + str(best_acc1) + "  time3\n")  # 将 best_acc 转换为字符串并写入文件
             print("best_acc2 = {:4.2f}".format(best_acc1))
 
     # with torch.no_grad():
@@ -234,10 +283,10 @@ def main(args: argparse.Namespace):
 
 def train(source_iter, target_iter, model: ImageClassifier,
           domain_adv: ConditionalDomainAdversarialLoss, optimizer: SGD,
-          lr_scheduler, epoch: int, args: argparse.Namespace,a,b):
-    c=5.04e3
-    d=1.8
-    print(a,b,c,d)
+          lr_scheduler, epoch: int, args: argparse.Namespace, a, b):
+    c = 5.04e3  # 5.04e3
+    d = 1.8  # 1.8
+    print(a, b, c, d)
     device = args.device
     # switch to train mode
     model.train()
@@ -247,7 +296,6 @@ def train(source_iter, target_iter, model: ImageClassifier,
         # print('iter', i)
         x_s, labels_s, = next(source_iter)
         x_t, _ = next(target_iter)
-
         x_s = x_s.to(device)
         x_t = x_t.to(device)
 
@@ -259,54 +307,56 @@ def train(source_iter, target_iter, model: ImageClassifier,
         y_s, y_t = y.chunk(2, dim=0)
         f_s, f_t = f.chunk(2, dim=0)
 
-        #domain_discri = DomainDiscriminator(
+        # domain_discri = DomainDiscriminator(
         #   256, hidden_size=1024).to(device)
-
+        # label_pre=find_max_indices(y_s)
+        # acc=calculate_accuracy(label_pre,labels_s)
+        # total_acc+=acc
         cls_loss = F.cross_entropy(y_s, labels_s)
         transfer_loss, f_s_fft = domain_adv(y_s, f_s, y_t, f_t)
-
-        #fw_s=domain_discri(f_s)
-        #fw_fft=domain_discri(f_s_fft)
-        #fw_s=torch.mean(fw_s)
-        #fw_fft=torch.mean(fw_fft)
-        #print(fw_s,fw_fft)
-        #mmd_loss=mmd_rbf(f_s,f_s_fft)
-        #mmd_loss2=mmd_rbf(f_s,f_t)
-        #mmd_loss2=mmd_rbf(f_s,f_s_fft)
+        # print(y_s)
+        # print(labels_s)
+        # print(len(y_s))
+        # fw_s=domain_discri(f_s)
+        # fw_fft=domain_discri(f_s_fft)
+        # fw_s=torch.mean(fw_s)
+        # fw_fft=torch.mean(fw_fft)
+        # print(fw_s,fw_fft)
+        # mmd_loss=mmd_rbf(f_s,f_s_fft)
+        # mmd_loss2=mmd_rbf(f_s,f_t)
+        # mmd_loss2=mmd_rbf(f_s,f_s_fft)
         # # print('cls_loss', cls_loss)
         # # print('ot_loss', ot_loss)
-        #KL_loss=compute_kl_divergence(f_s, f_s_fft)
-        #print(KL_loss*c)
-        #print(KL_loss)
+        # KL_loss=compute_kl_divergence(f_s, f_s_fft)
+        # print(KL_loss*c)
+        # print(KL_loss)
         # max_loss=max(max_loss,KL_loss)
-        coral_loss=CORAL(f_s,f_s_fft)
-        #print("@@@@@@@@@@@@@@@@@")
-        #print(CORAL(f_s,f_s_fft)*5e3)
-         #print("#########")
-        #coral_loss2 = CORAL(f_s,f_t)i
-        #print(compute_lmmd(f_s,f_s_fft)*c)
-        #print(f_s.size())
-        #wd_loss=torch.abs(fw_s-fw_fft)
-        #M = ot.dist(f_s.detach().cpu().numpy(),f_s_fft.detach().cpu().numpy())  # 计算成本矩阵
-        #emd = ot.emd2([], [], M)
-        #N = ot.dist(f_s.detach().cpu().numpy(),f_t.detach().cpu().numpy())  # 计算成本矩阵
-        #emd2 = ot.emd2([], [], N)
-        #print(emd+emd2)
-        #print(emd)
-        #ot_loss=OT(y_s,f_s,y_s,f_s_fft,labels_s)
-        #ot_loss2=OT(y_s,f_s,y_t,f_t,labels_s)
-        #Loss实现，和SDAT相比就改了系数和加了个coral_loss
-
-
-        loss = d*(a * cls_loss + transfer_loss * b +coral_loss*c)#*1.+compute_lmmd(f_s,f_s_fft)*d*0.)
-        #加了个coral_loss(fft变换后和变换前的feature的loss)，变了下权重
-
-        #print(wd_loss)
-        #print("#########")
-        #print(compute_lmmd(f_s,f_s_fft))
-        #print(compute_lmmd(f_s,f_t))
-        #print(coral_loss,coral_loss2)
-        #print("############")
+        coral_loss = CORAL(f_s, f_s_fft)
+        # print("@@@@@@@@@@@@@@@@@")
+        # print(CORAL(f_s,f_s_fft)*5e3)
+        # print("#########")
+        # coral_loss2 = CORAL(f_s,f_t)i
+        # print(compute_lmmd(f_s,f_s_fft)*c)
+        # print(f_s.size())
+        # wd_loss=torch.abs(fw_s-fw_fft)
+        # M = ot.dist(f_s.detach().cpu().numpy(),f_s_fft.detach().cpu().numpy())  # 计算成本矩阵
+        # emd = ot.emd2([], [], M)
+        # N = ot.dist(f_s.detach().cpu().numpy(),f_t.detach().cpu().numpy())  # 计算成本矩阵
+        # emd2 = ot.emd2([], [], N)
+        # print(emd+emd2)
+        # print(emd)
+        # ot_loss=OT(y_s,f_s,y_s,f_s_fft,labels_s)
+        # ot_loss2=OT(y_s,f_s,y_t,f_t,labels_s)
+        loss = d * a * cls_loss + d * transfer_loss * b + d * coral_loss * c
+        # print(a * cls_loss)
+        # print(transfer_loss * b)
+        # print(coral_loss)
+        # print(wd_loss)
+        # print("#########")
+        # print(compute_lmmd(f_s,f_s_fft))
+        # print(compute_lmmd(f_s,f_t))
+        # print(coral_loss,coral_loss2)
+        # print("############")
         # print(KL_loss)
         # cls_acc = accuracy(y_s, labels_s)[0]
 
@@ -315,6 +365,7 @@ def train(source_iter, target_iter, model: ImageClassifier,
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
+    # tsne.visualize(f_s.detach().cpu(),f_t.detach().cpu(),'test.png')
     # print(max_loss)
 
 
@@ -383,10 +434,10 @@ if __name__ == '__main__':
     # dataset parameters
     parser.add_argument('--dataset', default='Office-home', type=str,
                         help='which dataset')
-    parser.add_argument('--src_address', default=r'/public/home/zdh_xbr_ll/LROT_supp/data/office-home/Clipart.txt',
+    parser.add_argument('--src_address', default=r'/root/autodl-fs/LROT_supp/data/Office-31/webcam.txt',
                         type=str,
                         help='address of image list of source dataset')
-    parser.add_argument('--tgt_address', default=r'/public/home/zdh_xbr_ll/LROT_supp/data/office-home/Real_World.txt', type=str,
+    parser.add_argument('--tgt_address', default=r'/root/autodl-fs/LROT_supp/data/Office-31/amazon.txt', type=str,
                         help='address of image list of target dataset')
     parser.add_argument('--stats_file', default=None, type=str,
                         help='store the training loss and and validation acc')
@@ -454,7 +505,9 @@ if __name__ == '__main__':
                         help='seed for initializing training. ')
 
     args = parser.parse_args()
+    # torch.cuda.device_count()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # torch.cuda.set_device(1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(torch.cuda.is_available())
     args.device = device
